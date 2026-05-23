@@ -1,644 +1,438 @@
-"""
-P2P File Sharing Application
-CMP2204 Term Project - Spring 2026
-Functional Specification uyumlu tam implementasyon
-
-Düzeltmeler:
-  1. Broadcast IP sabit 192.168.1.255 (Req 2.1.0-B)
-  2. İçerik sözlüğü 120 saniyede temizleniyor (Req 2.2.0-G - "last 2 minutes")
-  3. my_chunks global olarak tanımlandı (runtime hatası giderildi)
-"""
-
 import socket
-import threading
 import json
 import time
+import threading
 import os
-import sys
 import random
 import base64
+from datetime import datetime
+import pyDes
+import sys
+from split_and_merge import chunk_announcer_real, chunk_merger_real
 
-try:
-    import pyDes
-except ImportError:
-    pyDes = None  # Opsiyonel; şifreli indirme için gerekli
-
-# ==============================================================
-# SABİTLER
-# ==============================================================
-BROADCAST_IP   = "192.168.1.255"   # Req 2.1.0-B: sabit broadcast adresi
-ANNOUNCE_PORT  = 6000              # Req 2.2.0-A: UDP dinleme portu
-UPLOAD_PORT    = 6001              # Req 2.4.0-A: TCP upload portu
-ANNOUNCE_INTERVAL  = 8            # Req 2.1.0-B: 8 saniyede bir
-WIPE_INTERVAL      = 120          # Req 2.2.0-G: 2 dakika (120 sn) sonra temizle
-
-# Diffie-Hellman parametreleri (Req Sec 1.1)
-DH_P = 907
-DH_G = 7
-
-NUM_CHUNKS = 3  # Her dosya 3 parçaya bölünür (Req 2.1.0-A)
-
-# ==============================================================
-# PAYLAŞILAN VERİ YAPILARI
-# ==============================================================
-# ip -> username  (Req 2.2.0-C)
-ip_to_username: dict = {}
-
-# username -> ip  (Req 2.2.0-E)
-username_to_ip: dict = {}
-
-# chunk_name -> [ip, ip, ...]  (Req 2.2.0-D)
-content_dict: dict = {}
-
-# Kilitler
-dict_lock = threading.Lock()
-
-# Global: bu node'un barındırdığı chunk listesi
-my_chunks: list = []
-my_username: str = ""
-
-# ==============================================================
-# YARDIMCI FONKSİYONLAR
-# ==============================================================
-
-def divide_into_chunks(filepath: str) -> list:
-    """
-    Dosyayı NUM_CHUNKS eşit parçaya böler ve ayrı dosyalar olarak kaydeder.
-    Req 2.1.0-A: chunk isimleri indeksli, .png eki olmadan.
-    Döndürür: chunk dosya isimlerinin listesi (ör. ['forest_1', 'forest_2', 'forest_3'])
-    """
-    base = os.path.splitext(os.path.basename(filepath))[0]  # 'forest'
-    with open(filepath, "rb") as f:
-        data = f.read()
-
-    size = len(data)
-    chunk_size = (size + NUM_CHUNKS - 1) // NUM_CHUNKS
-    chunk_names = []
-
-    for i in range(NUM_CHUNKS):
-        chunk_data = data[i * chunk_size: (i + 1) * chunk_size]
-        chunk_name = f"{base}_{i + 1}"          # ör. forest_1
-        chunk_file = chunk_name                  # uzantısız (Req 2.1.0-A)
-        with open(chunk_file, "wb") as cf:
-            cf.write(chunk_data)
-        chunk_names.append(chunk_name)
-
-    return chunk_names
+is_ui_active = False
+current_prompt = ""
 
 
-def merge_chunks(base_name: str, output_path: str):
-    """
-    3 chunk'ı birleştirip tek dosya oluşturur. (Req 2.3.0-I)
-    base_name: ör. 'forest'  →  forest_1, forest_2, forest_3 aranır
-    """
-    with open(output_path, "wb") as out:
-        for i in range(1, NUM_CHUNKS + 1):
-            chunk_file = f"{base_name}_{i}"
-            with open(chunk_file, "rb") as cf:
-                out.write(cf.read())
-    print(f"[BİLGİ] Dosya birleştirildi: {output_path}")
+P = 907
+G = 7
 
+# ---------------------------------------------------------
+# ORTAK SÖZLÜKLER (SHARED DICTIONARIES) - Req 2.2.0-C, D, E
+# ---------------------------------------------------------
+ip_to_username = {}
+username_to_ip = {}
+content_dict = {}  # Formatı bu "chunk_name": ["username1", "username2"]
 
-def dh_shared_key(their_public: int, my_private: int) -> int:
-    """Diffie-Hellman: shared = their_public^my_private mod p"""
-    return pow(their_public, my_private, DH_P)
+# ---------------------------------------------------------
+# Security ve Cryptography (Req 1.1)
+# ---------------------------------------------------------
+def generate_dh_private_key():
+    return random.randint(2, P - 2)
 
+def calculate_dh_public_key(private_key):
+    return (G ** private_key) % P
 
-def dh_public(my_private: int) -> int:
-    """DH public = g^private mod p"""
-    return pow(DH_G, my_private, DH_P)
+def calculate_dh_shared_secret(remote_public, private_key):
+    return (remote_public ** private_key) % P
 
-
-def make_des_key(shared_secret_int: int) -> bytes:
-    """
-    Shared secret'ı 8-byte DES anahtarına dönüştürür.
-    Req Sec 1.1: zfill(8)[:8]
-    """
+def get_des_key_bytes(shared_secret_int):
+    # padding/truncation işlemi
     des_key_string = str(shared_secret_int).zfill(8)[:8]
-    return des_key_string.encode("utf-8")
+    return des_key_string.encode('utf-8')
 
+def get_chunk_bytes(chunk_name):
+    """Diskteki chunk dosyasını ikili (binary) modda okur ve byte olarak döndürür."""
+    try:
+        with open(chunk_name, 'rb') as f:
+            return f.read()
+    except FileNotFoundError:
+        print(f"\n[HATA] {chunk_name} diskinizde bulunamadı!")
+        return b"" # Dosya yoksa boş byte döndür
 
-def encrypt_chunk(raw_bytes: bytes, des_key: bytes) -> str:
-    """Chunk'ı DES ile şifreler, Base64 string döndürür. Req Sec 1.1"""
-    if pyDes is None:
-        raise ImportError("pyDes yüklü değil. 'pip install pyDes' ile yükleyin.")
-    encrypted = pyDes.des(des_key, pyDes.ECB, pad=None,
-                          padmode=pyDes.PAD_PKCS5).encrypt(raw_bytes)
-    return base64.b64encode(encrypted).decode("utf-8")
-
-
-def decrypt_chunk(encoded_str: str, des_key: bytes) -> bytes:
-    """Base64 decode + DES şifresi çözer. Req Sec 1.1"""
-    if pyDes is None:
-        raise ImportError("pyDes yüklü değil.")
-    encrypted = base64.b64decode(encoded_str)
-    return pyDes.des(des_key, pyDes.ECB, pad=None,
-                     padmode=pyDes.PAD_PKCS5).decrypt(encrypted)
-
-
-def to_b64_string(raw_bytes: bytes) -> str:
-    """Ham bytes'ı JSON'a gömülecek Base64 string'e çevirir."""
-    return base64.b64encode(raw_bytes).decode("utf-8")
-
-
-def from_b64_string(s: str) -> bytes:
-    """Base64 string'i bytes'a geri çevirir."""
-    return base64.b64decode(s)
-
-
-def log_event(filename: str, entry: str):
-    """Zaman damgalı log satırı ekler."""
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(filename, "a") as f:
-        f.write(f"[{ts}] {entry}\n")
-
-# ==============================================================
-# 1) CHUNK ANNOUNCER — UDP BROADCAST (Req 2.1.x)
-# ==============================================================
-
-def chunk_announcer(username: str, chunks_to_host: list):
-    """
-    Her 8 saniyede bir broadcast UDP mesajı gönderir.
-    Req 2.1.0-B: broadcast IP = 192.168.1.255 (SABİT)
-    Req 2.1.0-D: JSON format {"username": ..., "chunks": [...]}
-    """
+# ---------------------------------------------------------
+# 2.1 CHUNK ANNOUNCER (UDP BROADCAST)
+# ---------------------------------------------------------
+def chunk_announcer(username, chunks_to_host):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    print(f"\n[CHUNK ANNOUNCER] Anons başlıyor → {BROADCAST_IP}:{ANNOUNCE_PORT} (her {ANNOUNCE_INTERVAL}s)")
+    print("\n[CHUNK ANNOUNCER] Dosyalar anons edilmeye başlanıyor... (Her 8 saniyede bir)")
+    broadcast_ip = '<broadcast>' # 192.168.1.255 olacak sonrasında
 
     while True:
-        # Req 2.1.0-C: dizindeki güncel dosya listesini oku
         try:
-            # my_chunks global listesi dinamik olarak güncellenebilir
-            with dict_lock:
-                current_chunks = list(chunks_to_host)
-
             announce_msg = {
-                "username": username,   # Req 2.1.0-D: anahtar tam "username"
-                "chunks": current_chunks  # Req 2.1.0-D: anahtar tam "chunks"
+                "username": username,
+                "chunks": chunks_to_host
             }
-            payload = json.dumps(announce_msg).encode("utf-8")
-            sock.sendto(payload, (BROADCAST_IP, ANNOUNCE_PORT))
+            json_msg = json.dumps(announce_msg).encode('utf-8')
+
+            sock.sendto(json_msg, (broadcast_ip, 6000))
         except Exception as e:
-            print(f"[HATA][ANNOUNCER] {e}")
+            print(f"\n[HATA] Anons atılırken bir sorun oluştu: {e}")
+        time.sleep(8)
 
-        time.sleep(ANNOUNCE_INTERVAL)
-
-# ==============================================================
-# 2) CONTENT DISCOVERY — UDP LISTENER (Req 2.2.x)
-# ==============================================================
-
+# ---------------------------------------------------------
+# 2.2 CONTENT DISCOVERY (UDP LISTENER)
+# ---------------------------------------------------------
 def content_discovery():
-    """
-    UDP port 6000'i dinler. Gelen anonsları ayrıştırıp sözlükleri günceller.
-    Req 2.2.0-A, 2.2.0-B, 2.2.0-C, 2.2.0-D, 2.2.0-E, 2.2.0-F
-    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Aynı makinede birden fazla node test edebilmek için REUSEADDR açık
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", ANNOUNCE_PORT))
-    print(f"[CONTENT DISCOVERY] UDP port {ANNOUNCE_PORT} dinleniyor...")
+    sock.bind(('0.0.0.0', 6000))
+
+    print("[CONTENT DISCOVERY] Port 6000 dinleniyor...")
 
     while True:
         try:
-            data, addr = sock.recvfrom(65535)   # Req 2.2.0-B: recvfrom() ile IP al
-            sender_ip = addr[0]
+            data, addr = sock.recvfrom(1024)
+            ip_address = addr[0]
+            msg = json.loads(data.decode('utf-8'))
 
-            msg = json.loads(data.decode("utf-8"))  # Req 2.2.0-B: JSON parse
-            username = msg.get("username", "")
-            chunks   = msg.get("chunks", [])
+            # Format doğrulaması
+            if "username" in msg and "chunks" in msg:
+                sender_username = msg["username"]
+                hosted_chunks = msg["chunks"]
 
-            with dict_lock:
-                ip_to_username[sender_ip] = username    # Req 2.2.0-C
-                username_to_ip[username]  = sender_ip   # Req 2.2.0-E
+                # IP ve Kullanıcı Adı eşleşmelerini kaydet (Req 2.2.0-C ve E)
+                ip_to_username[ip_address] = sender_username
+                username_to_ip[sender_username] = ip_address
 
-                for chunk in chunks:                    # Req 2.2.0-D
+                # İçerik sözlüğünü güncelle (Req 2.2.0-D)
+                inserted_any = False
+                for chunk in hosted_chunks:
                     if chunk not in content_dict:
                         content_dict[chunk] = []
-                    if sender_ip not in content_dict[chunk]:
-                        content_dict[chunk].append(sender_ip)
+                    if sender_username not in content_dict[chunk]:
+                        content_dict[chunk].append(sender_username)
+                        inserted_any = True  # Yeni bir kayıt eklendiğini işaretle
 
-            # Req 2.2.0-F: konsolda görüntüle
-            print(f"\n[DISCOVERY] {username} ({sender_ip}): {', '.join(chunks)}")
+                # Konsola yazdır (Req 2.2.0-F) - SADECE YENİ BİR ŞEY EKLENDİYSE
+                if inserted_any:
+                    chunks_str = ", ".join(hosted_chunks)
+                    log_msg = f"[KEŞİF] {sender_username} : {chunks_str}"
 
-        except json.JSONDecodeError:
+                    global is_ui_active, current_prompt
+                    sys.stdout.write('\r' + ' ' * 80 + '\r') # öncelik olsun diye sys kullan
+                    print(log_msg)
+
+                    # Eğer kullanıcı o an input bekliyorsa, soruyu tekrar yazdır
+                    if is_ui_active:
+                        sys.stdout.write(current_prompt)
+                        sys.stdout.flush()
+        except Exception as e:
             pass
-        except Exception as e:
-            print(f"[HATA][DISCOVERY] {e}")
 
-
+# ---------------------------------------------------------
+# Req 2.2.0-G: Clear dictionary once per 60 seconds.
+# ---------------------------------------------------------
 def wipe_dictionary_routine():
-    """
-    Req 2.2.0-G: 120 saniyede bir içerik sözlüğünü temizle ("last 2 minutes").
-    """
     while True:
-        time.sleep(WIPE_INTERVAL)
-        with dict_lock:
-            content_dict.clear()
-        print(f"\n[SİSTEM] İçerik sözlüğü temizlendi ({WIPE_INTERVAL}s recency kuralı).")
+        time.sleep(60)
+        content_dict.clear()
+        print("\n[SİSTEM] İçerik sözlüğü temizlendi.")
 
-# ==============================================================
-# 3) CHUNK UPLOADER — TCP SERVER (Req 2.4.x)
-# ==============================================================
-
-def handle_upload_client(conn: socket.socket, addr):
+# ---------------------------------------------------------
+# 2.3.0-B View contents
+# ---------------------------------------------------------
+def view_contents():
     """
-    Gelen TCP bağlantısını işler.
-    Req 2.4.0-C: JSON ayrıştır → key exchange / secure / unsecure
+    Sözlükteki chunk isimlerini (örn: forest_1) baz adına (forest) çevirerek
+    benzersiz dosyaları listeler.
     """
-    peer_ip = addr[0]
-    with dict_lock:
-        peer_name = ip_to_username.get(peer_ip, peer_ip)
+    print("\n--- AĞDA BULUNAN İÇERİKLER ---")
+    available_files = set()
 
-    dh_shared = None  # Bu session'daki paylaşık anahtar
+    for chunk_name in content_dict.keys():
+        # Sondaki '_1', '_2' kısmını atarak asıl dosya adını buluyoruz
+        base_name = chunk_name.rsplit('_', 1)[0]
+        available_files.add(base_name)
+
+    if not available_files:
+        print("Şu an ağda keşfedilmiş bir içerik yok. (Bekleniyor...)")
+    else:
+        for file in available_files:
+            print(f"- {file}")
+    print("------------------------------")
+
+# ---------------------------------------------------------
+# 2.3 CHUNK DOWNLOADER
+# ---------------------------------------------------------
+def download_single_chunk(chunk_name, ip_address, is_secure):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(45) #pyDes yüzünden...
+    target_username = ip_to_username.get(ip_address, ip_address)
 
     try:
-        while True:
-            raw = b""
+        sock.connect((ip_address, 6001))
+        print(
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] {chunk_name} is requested from user {target_username}...")
+
+        if is_secure:
+            # Diffie-Hellman Key Exchange
+            my_private = generate_dh_private_key()
+            my_public = calculate_dh_public_key(my_private)
+
+            dh_req = {"key": str(my_public)}
+            sock.sendall(json.dumps(dh_req).encode('utf-8'))
+
+            reply_data = sock.recv(1024).decode('utf-8')
+            remote_public = int(json.loads(reply_data)["key"])
+            shared_secret = calculate_dh_shared_secret(remote_public, my_private)
+
+            content_req = {"requested secured content": chunk_name}
+            sock.sendall(json.dumps(content_req).encode('utf-8'))
+
+            raw_data = b""
             while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                raw += chunk
                 try:
-                    msg = json.loads(raw.decode("utf-8"))
-                    break  # Tam JSON alındı
-                except json.JSONDecodeError:
-                    continue
-
-            if not raw:
-                break
-
-            msg = json.loads(raw.decode("utf-8"))
-
-            # (i) Key exchange — Req 2.4.0-C (i)
-            if "key" in msg:
-                their_public = int(msg["key"])
-                my_private   = random.randint(2, DH_P - 2)
-                my_pub       = dh_public(my_private)
-                dh_shared    = dh_shared_key(their_public, my_private)
-
-                response = json.dumps({"key": str(my_pub)}).encode("utf-8")
-                conn.sendall(response)
-                continue  # Bir sonraki mesajı bekle (chunk isteği)
-
-            # (ii) Şifreli içerik isteği — Req 2.4.0-C (ii)
-            elif "requested_secured_content" in msg:
-                chunk_name = msg["requested_secured_content"]
-                print(f"\n[UPLOADER] {peer_name} → şifreli '{chunk_name}' istedi")
-
-                if not os.path.exists(chunk_name):
-                    print(f"[UYARI][UPLOADER] Chunk bulunamadı: {chunk_name}")
+                    packet = sock.recv(8192)
+                    if not packet:
+                        break
+                    raw_data += packet
+                except socket.timeout:
                     break
 
-                with open(chunk_name, "rb") as f:
-                    raw_bytes = f.read()
+            reply_data = raw_data.decode('utf-8')
+            if not reply_data:
+                print(f"\n[ERROR] Data has not been came from user {target_username} (Timeout or disconnected).")
+                return False
+            response = json.loads(reply_data)
+            # data_reply = sock.recv(4096).decode('utf-8')
+            # msg = json.loads(data_reply)
 
-                des_key = make_des_key(dh_shared)
-                enc_str = encrypt_chunk(raw_bytes, des_key)
+            encrypted_bytes = base64.b64decode(response["encrypted chunk"])
+            des_key = get_des_key_bytes(shared_secret)
+            decrypted_bytes = pyDes.des(des_key, pyDes.ECB, pad=None, padmode=pyDes.PAD_PKCS5).decrypt(encrypted_bytes)
 
-                payload = json.dumps({
-                    "chunk_name": chunk_name,
-                    "encrypted_chunk": enc_str
-                }).encode("utf-8")
-                conn.sendall(payload)
+            file_data = decrypted_bytes
+            with open(chunk_name, 'wb') as f:
+                f.write(decrypted_bytes)
+            print(f"[SUCCESS] {chunk_name} has been downloaded securely.")
 
-                # Req 2.4.0-D: log
-                log_event("upload_log.txt",
-                          f"SENT | {chunk_name} | {peer_name}")
-                print(f"[UPLOADER] '{chunk_name}' → {peer_name} (şifreli) gönderildi")
-                break
+        else: # unsecure
+            content_req = {"requested content": chunk_name}
+            sock.sendall(json.dumps(content_req).encode('utf-8'))
 
-            # (iii) Şifresiz içerik isteği — Req 2.4.0-C (iii)
-            elif "requested_content" in msg:
-                chunk_name = msg["requested_content"]
-                print(f"\n[UPLOADER] {peer_name} → '{chunk_name}' istedi")
-
-                if not os.path.exists(chunk_name):
-                    print(f"[UYARI][UPLOADER] Chunk bulunamadı: {chunk_name}")
-                    break
-
-                with open(chunk_name, "rb") as f:
-                    raw_bytes = f.read()
-
-                json_safe = to_b64_string(raw_bytes)
-                payload = json.dumps({
-                    "chunk_name": chunk_name,
-                    "data": json_safe
-                }).encode("utf-8")
-                conn.sendall(payload)
-
-                log_event("upload_log.txt",
-                          f"SENT | {chunk_name} | {peer_name}")
-                print(f"[UPLOADER] '{chunk_name}' → {peer_name} (şifresiz) gönderildi")
-                break
-
-            else:
-                print(f"[UYARI][UPLOADER] Tanımsız mesaj: {msg}")
-                break
-
-    except Exception as e:
-        print(f"[HATA][UPLOADER] {peer_name}: {e}")
-    finally:
-        conn.close()  # Req 2.4.0-E: bağlantı kapandıktan sonra sunucu devam eder
-
-
-def chunk_uploader():
-    """
-    TCP port 6001'i dinler, gelen her bağlantı için yeni thread açar.
-    Req 2.4.0-A, 2.4.0-B, 2.4.0-E
-    """
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("", UPLOAD_PORT))
-    server.listen(10)
-    print(f"[CHUNK UPLOADER] TCP port {UPLOAD_PORT} dinleniyor...")
-
-    while True:  # Req 2.4.0-E: sonlanmaz
-        try:
-            conn, addr = server.accept()  # Req 2.4.0-B: timeout öncesi kabul et
-            t = threading.Thread(target=handle_upload_client, args=(conn, addr), daemon=True)
-            t.start()
-        except Exception as e:
-            print(f"[HATA][UPLOADER-SERVER] {e}")
-
-# ==============================================================
-# 4) CHUNK DOWNLOADER — TCP CLIENT (Req 2.3.x)
-# ==============================================================
-
-def download_chunk_tcp(peer_ip: str, chunk_name: str, secure: bool) -> bool:
-    """
-    Tek bir chunk'ı belirtilen peer'dan indirir.
-    Req 2.3.0-D, 2.3.0-E, 2.3.0-F, 2.3.0-G, 2.3.0-J, 2.3.0-K
-    Başarı durumunda True döner.
-    """
-    with dict_lock:
-        peer_name = ip_to_username.get(peer_ip, peer_ip)
-
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{ts}][DOWNLOADER] '{chunk_name}' → {peer_name} ({peer_ip}) isteği gönderiliyor...")
-
-    dh_shared = None
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((peer_ip, UPLOAD_PORT))
-
-        # --- Güvenli indirme: önce key exchange ---
-        if secure:
-            my_private = random.randint(2, DH_P - 2)  # Req 2.3.0-F
-            my_pub     = dh_public(my_private)
-
-            key_msg = json.dumps({"key": str(my_pub)}).encode("utf-8")
-            sock.sendall(key_msg)
-
-            # Karşı tarafın public key'ini al
-            resp_raw = b""
+            raw_data = b""
             while True:
-                part = sock.recv(4096)
-                if not part:
-                    break
-                resp_raw += part
                 try:
-                    json.loads(resp_raw.decode("utf-8"))
+                    packet = sock.recv(8192)
+                    if not packet:
+                        break
+                    raw_data += packet
+                except socket.timeout:
                     break
-                except json.JSONDecodeError:
-                    continue
 
-            resp = json.loads(resp_raw.decode("utf-8"))
-            their_public = int(resp["key"])
-            dh_shared    = dh_shared_key(their_public, my_private)
+            reply_data = raw_data.decode('utf-8')
+            if not reply_data:
+                print(f"\n[ERROR] Data has not been came from user {target_username} (Timeout or disconnected).")
+                return False
+            response = json.loads(reply_data)
+            # data_reply = sock.recv(4096).decode('utf-8')
+            # msg = json.loads(data_reply)
 
-            # Şifreli içerik isteği — Req 2.3.0-F
-            req = json.dumps({"requested_secured_content": chunk_name}).encode("utf-8")
-        else:
-            # Şifresiz içerik isteği — Req 2.3.0-G
-            req = json.dumps({"requested_content": chunk_name}).encode("utf-8")
+            unencrypted_bytes = base64.b64decode(response["data"])
+            with open(chunk_name, 'wb') as f:
+                f.write(unencrypted_bytes)
+            print(f"[SUCCESS] {chunk_name} has been downloaded insecurely.")
 
-        sock.sendall(req)
+        global my_chunks
+        if chunk_name not in my_chunks:
+            my_chunks.append(chunk_name)
+            print(
+                f"[P2P] {chunk_name} has been downloaded successfully and is being presented by you too.")
 
-        # Yanıtı al
-        resp_raw = b""
-        while True:
-            part = sock.recv(65535)
-            if not part:
-                break
-            resp_raw += part
-            try:
-                json.loads(resp_raw.decode("utf-8"))
-                break
-            except json.JSONDecodeError:
-                continue
+        # Loglama
+        with open(f"download_log_{my_username}.txt", "a") as f:
+            f.write(
+                f"[{datetime.now()}] {chunk_name} downloaded from address {ip_address} ({target_username}) - RECEIVED\n")
 
-        resp = json.loads(resp_raw.decode("utf-8"))
-
-        if "encrypted_chunk" in resp:
-            des_key   = make_des_key(dh_shared)
-            raw_bytes = decrypt_chunk(resp["encrypted_chunk"], des_key)
-        elif "data" in resp:
-            raw_bytes = from_b64_string(resp["data"])
-        else:
-            print(f"[HATA][DOWNLOADER] Beklenmeyen yanıt: {resp}")
-            sock.close()
-            return False
-
-        # Chunk'ı kaydet
-        received_chunk_name = resp.get("chunk_name", chunk_name)
-        with open(received_chunk_name, "wb") as f:
-            f.write(raw_bytes)
-
-        # Req 2.3.0-K: RECEIVED logu
-        log_event("download_log.txt",
-                  f"RECEIVED | {chunk_name} | {peer_name}")
-        print(f"[DOWNLOADER] '{chunk_name}' başarıyla alındı ({peer_name})")
-
-        sock.close()  # Req 2.3.0-J
         return True
 
     except Exception as e:
-        print(f"[HATA][DOWNLOADER] '{chunk_name}' indirilemedi ({peer_ip}): {e}")
-        try:
-            sock.close()
-        except Exception:
-            pass
+        print(f"[ERROR] {chunk_name} couldnt be downloaded from user {target_username}: {e}")
         return False
+    finally:
+        sock.close()
 
+def download_content():
+    global is_ui_active, current_prompt
 
-def initiate_content_download(content_name: str, secure: bool):
-    """
-    3 chunk'ı sırayla indirir, birleştirir.
-    Req 2.3.0-C, 2.3.0-D, 2.3.0-H, 2.3.0-I, 2.3.0-L
-    """
-    base = os.path.splitext(content_name)[0]  # 'forest.png' → 'forest'
-    all_ok = True
+    current_prompt = "\nEnter the name of content you want to download (ex. forest): "
+    is_ui_active = True
+    content_base_name = input(current_prompt)
+    content_base_name = content_base_name.rsplit(".", 1)[0]
 
-    for i in range(1, NUM_CHUNKS + 1):
-        chunk_name = f"{base}_{i}"   # 'forest_1', 'forest_2', 'forest_3'
+    current_prompt = "Do you want secure or insecure? (S/I): "
+    sec_choice = input(current_prompt).lower()
+    is_ui_active = False
 
-        with dict_lock:
-            peers = list(content_dict.get(chunk_name, []))
+    is_secure = True if sec_choice == 's' else False
+    downloaded_chunks = []
 
-        if not peers:
-            print(f"[UYARI] CHUNK {chunk_name} için ağda kaynak bulunamadı.")
-            all_ok = False
-            continue
+    # Loop for 3 chunks (ex: forest_1, forest_2, forest_3)
+    for i in range(1, 4):
+        chunk_name = f"{content_base_name}_{i}"
+        success = False
 
-        downloaded = False
-        for peer_ip in peers:
-            success = download_chunk_tcp(peer_ip, chunk_name, secure)
-            if success:
-                downloaded = True
-                break
+        # Whos have this chunk?
+        if chunk_name in content_dict:
+            hosting_users = content_dict[chunk_name]
+            for user in hosting_users:
+                ip_addr = username_to_ip.get(user)
+                if ip_addr:
+                    if download_single_chunk(chunk_name, ip_addr, is_secure):
+                        downloaded_chunks.append(chunk_name)
+                        success = True
+                        break  # No need to check other users if its successful
+
+        if not success:
+            print(f"\n[WARNING] {chunk_name} couldnt be downloaded from any user in network!")
+            return  # Cancel if anything is missed
+
+    if len(downloaded_chunks) == 3:
+        chunk_merger_real(content_base_name, downloaded_chunks)
+        print(f"\n[SYSTEM] '{content_base_name}' has been merged successfully! Check your folder.")
+
+# ---------------------------------------------------------
+# 2.4 CHUNK UPLOADER (TCP LISTENER)
+# ---------------------------------------------------------
+def handle_tcp_client(conn, addr):
+    try:
+        data = conn.recv(4096).decode('utf-8')
+        if not data: return
+
+        msg = json.loads(data)
+
+        # 1. Aşama: Anahtar Değişimi İstendiyse
+        if "key" in msg:
+            remote_public = int(msg["key"])
+            my_private = generate_dh_private_key()
+            my_public = calculate_dh_public_key(my_private)
+
+            shared_secret = calculate_dh_shared_secret(remote_public, my_private)
+
+            # Kendi public key'imizi gönderiyoruz
+            reply = {"key": str(my_public)}
+            conn.sendall(json.dumps(reply).encode('utf-8'))
+
+            # Şimdi aynı bağlantı üzerinden asıl dosya isteğini bekle (Secure Request)
+            data2 = conn.recv(4096).decode('utf-8')
+            msg2 = json.loads(data2)
+
+            if "requested secured content" in msg2:
+                chunk_name = msg2["requested secured content"]
+                raw_bytes = get_chunk_bytes(chunk_name)
+
+                # pyDes ile Şifreleme
+                des_key = get_des_key_bytes(shared_secret)
+                encrypted_bytes = pyDes.des(des_key, pyDes.ECB, pad=None, padmode=pyDes.PAD_PKCS5).encrypt(raw_bytes)
+                encoded_string = base64.b64encode(encrypted_bytes).decode('utf-8')
+
+                final_reply = {
+                    "chunk name": chunk_name,
+                    "encrypted chunk": encoded_string
+                }
+                conn.sendall(json.dumps(final_reply).encode('utf-8'))
+
+                # Secure (Şifreli) loglama kısmı:
+                with open(f"upload_log_{my_username}.txt", "a") as f:
+                    f.write(f"[{datetime.now()}] {chunk_name} sent to {addr[0]} (SECURE)\n")
+
+        # 2. Aşama: Şifresiz İçerik İstendiyse
+        elif "requested content" in msg:
+            chunk_name = msg["requested content"]
+            raw_bytes = get_chunk_bytes(chunk_name)
+
+            encoded_string = base64.b64encode(raw_bytes).decode('utf-8')
+
+            final_reply = {
+                "chunk name": chunk_name,
+                "data": encoded_string
+            }
+            conn.sendall(json.dumps(final_reply).encode('utf-8'))
+
+            # Loglama
+            with open(f"upload_log_{my_username}.txt", "a") as f:
+                f.write(f"[{datetime.now()}] {chunk_name} sent to {addr[0]} (UNSECURE)\n")
+
+    except Exception as e:
+        print(f"\n[UPLOAD HATA] {e}")
+    finally:
+        conn.close()
+
+def chunk_uploader():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('0.0.0.0', 6001))
+    sock.listen(5)
+
+    print("[CHUNK UPLOADER] Port 6001 dinleniyor (TCP)...")
+
+    while True:
+        try:
+            conn, addr = sock.accept()
+            # Gelen her TCP isteği arayüzü dondurmasın diye ayrı bir thread'de işlenir
+            threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True).start()
+        except Exception as e:
+            pass
+
+# ---------------------------------------------------------
+# KULLANICI ARAYÜZÜ (MENÜ)
+# ---------------------------------------------------------
+def user_interface():
+    global is_ui_active, current_prompt
+    while True:
+        is_ui_active = False
+
+        print("\n=== P2P DOSYA PAYLAŞIM MENÜSÜ ===")
+        print("1. View Contents (Ağdaki İçerikleri Gör)")
+        print("2. Download Content (İçerik İndir)")
+        print("3. History (İndirme/Yükleme Geçmişi)")
+        print("4. Çıkış")
+
+        current_prompt = "Seçiminiz (1/2/3/4): "
+        is_ui_active = True
+        choice = input(current_prompt)
+        is_ui_active = False  # Seçim yapıldıktan sonra kapat
+
+        if choice == '1':
+            view_contents()
+        elif choice == '2':
+            download_content()
+        elif choice == '3':
+            print("\n--- DOWNLOAD GEÇMİŞİ ---")
+            log_file = f"download_log_{my_username}.txt"
+            if os.path.exists(log_file):
+                with open(log_file, "r") as f:
+                    print(f.read())
             else:
-                with dict_lock:
-                    uname = ip_to_username.get(peer_ip, peer_ip)
-                print(f"[BİLGİ] Chunk {chunk_name} → {uname} üzerinden indirilemedi.")
-
-        if not downloaded:
-            print(f"[UYARI] CHUNK {chunk_name} CANNOT BE DOWNLOADED FROM ONLINE PEERS.")
-            all_ok = False
-
-    if all_ok:
-        output_file = f"{base}_merged.png"
-        merge_chunks(base, output_file)
-        # Req 2.3.0-L: download log
-        log_event("download_log.txt",
-                  f"MERGED | {output_file} | tamamlandı")
-        print(f"\n[BİLGİ] '{output_file}' başarıyla indirildi ve birleştirildi!")
-    else:
-        print(f"\n[UYARI] '{content_name}' tam olarak indirilemedi.")
-
-
-def view_available_contents():
-    """
-    Req 2.3.0-B: chunk listesinden içerik isimlerini türetip göster (tekrarsız).
-    """
-    with dict_lock:
-        chunks = list(content_dict.keys())
-
-    if not chunks:
-        print("[BİLGİ] Şu an ağda içerik bulunamadı.")
-        return
-
-    contents = set()
-    for chunk in chunks:
-        # 'forest_1' → 'forest.png'
-        parts = chunk.rsplit("_", 1)
-        if len(parts) == 2:
-            contents.add(parts[0] + ".png")
+                print("Henüz indirme geçmişi yok.")
+        elif choice == '4':
+            print("\nProgram kapatılıyor...")
+            os._exit(0)
         else:
-            contents.add(chunk)
-
-    print("\n[MEVCUT İÇERİKLER]")
-    for c in sorted(contents):
-        print(f"  - {c}")
-
-
-def view_history():
-    """
-    Req 2.3.0-A, 2.3.0-K, 2.3.0-L: İndirme/yükleme geçmişi
-    """
-    for logfile in ("download_log.txt", "upload_log.txt"):
-        if os.path.exists(logfile):
-            print(f"\n--- {logfile} ---")
-            with open(logfile, "r") as f:
-                print(f.read())
-        else:
-            print(f"\n[{logfile}] henüz kayıt yok.")
-
-
-def chunk_downloader():
-    """
-    Kullanıcı arayüzü döngüsü.
-    Req 2.3.0-A: View Contents / Download Content / History
-    Req 2.3.0-M: sonlanmaz
-    """
-    print("\n[CHUNK DOWNLOADER] Hazır.")
-
-    while True:  # Req 2.3.0-M: sonlanmaz
-        print("\n" + "="*45)
-        print(" 1) View Contents")
-        print(" 2) Download Content")
-        print(" 3) History")
-        print(" 4) Çıkış")
-        print("="*45)
-        choice = input("Seçiminiz: ").strip()
-
-        if choice == "1":
-            view_available_contents()
-
-        elif choice == "2":
-            content_name = input("İndirilecek içerik adı (ör. forest.png): ").strip()
-            sec_input = input("Güvenli indir? (evet/hayır): ").strip().lower()
-            secure = sec_input in ("evet", "e", "yes", "y")
-            initiate_content_download(content_name, secure)
-
-        elif choice == "3":
-            view_history()
-
-        elif choice == "4":
-            print("[BİLGİ] Program sonlandırılıyor...")
-            sys.exit(0)
-
-        else:
-            print("[UYARI] Geçersiz seçim.")
-
-# ==============================================================
-# ANA PROGRAM
-# ==============================================================
-
-def main():
-    global my_username, my_chunks
-
-    print("=" * 50)
-    print("  P2P Dosya Paylaşım Uygulaması - CMP2204")
-    print("=" * 50)
-
-    my_username = input("Kullanıcı adınızı girin: ").strip()
-    if not my_username:
-        print("[HATA] Kullanıcı adı boş olamaz!")
-        sys.exit(1)
-
-    file_to_host = input("Host edilecek dosya (ör. forest.png): ").strip()
-    if not os.path.exists(file_to_host):
-        print(f"[HATA] '{file_to_host}' bulunamadı! Program sonlandırılıyor.")
-        sys.exit(1)
-
-    # Req 2.1.0-A: dosyayı chunk'lara böl, sayısını bildir
-    my_chunks = divide_into_chunks(file_to_host)
-    print(f"[BİLGİ] {len(my_chunks)} chunk hazırlandı: {my_chunks}")
-    print(f"[BİLGİ] Anons başlatılıyor, hazır olunuyor...")
-
-    # Thread'leri başlat
-    threading.Thread(
-        target=chunk_announcer,
-        args=(my_username, my_chunks),
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=content_discovery,
-        daemon=True
-    ).start()
-
-    # Req 2.2.0-G: 120 saniyede temizle
-    threading.Thread(
-        target=wipe_dictionary_routine,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=chunk_uploader,
-        daemon=True
-    ).start()
-
-    # Diğer node'ların kendini duyurmasına kısa süre ver
-    time.sleep(1)
-
-    # Kullanıcı arayüzü (bu thread main thread'de çalışır)
-    chunk_downloader()
-
+            print("\n[HATA] Geçersiz seçim, lütfen tekrar deneyin.")
 
 if __name__ == "__main__":
-    main()
+    global my_username
+    global my_chunks
+    my_username = input("Kullanıcı adınızı girin: ")
+    file_to_host = input("Host edilecek dosyanın adını girin (ör. forest.png): ")
+
+    if os.path.exists(file_to_host):
+        my_chunks = chunk_announcer_real(file_to_host, num_chunks=3)
+    else:
+        print(f"[UYARI] '{file_to_host}' klasörde bulunamadı. Sadece dinleyici olarak başlatılıyorsunuz.")
+        my_chunks = []
+
+    # Threadleri başlat (Chunk Uploader TCP Thread'i eklendi)
+    threading.Thread(target=chunk_announcer, args=(my_username, my_chunks), daemon=True).start()
+    threading.Thread(target=content_discovery, daemon=True).start()
+    threading.Thread(target=wipe_dictionary_routine, daemon=True).start()
+    threading.Thread(target=chunk_uploader, daemon=True).start()
+
+    time.sleep(1)
+    user_interface()

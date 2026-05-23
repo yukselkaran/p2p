@@ -131,7 +131,7 @@ def wipe_dictionary_routine():
     while True:
         time.sleep(60)
         content_dict.clear()
-        print("\n[SİSTEM] İçerik sözlüğü temizlendi.")
+        print("\n[SYSTEM] Content dictionary has been cleared.")
 
 # ---------------------------------------------------------
 # 2.3.0-B View contents
@@ -161,7 +161,7 @@ def view_contents():
 # ---------------------------------------------------------
 def download_single_chunk(chunk_name, ip_address, is_secure):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(45) #pyDes yüzünden...
+    sock.settimeout(None) #pyDes yüzünden...
     target_username = ip_to_username.get(ip_address, ip_address)
 
     try:
@@ -196,7 +196,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
 
             reply_data = raw_data.decode('utf-8')
             if not reply_data:
-                print(f"\n[ERROR] Data has not been came from user {target_username} (Timeout or disconnected).")
+                print(f"\n[ERROR] Data has not been pulled from user {target_username} (Timeout or disconnected).")
                 return False
             response = json.loads(reply_data)
             # data_reply = sock.recv(4096).decode('utf-8')
@@ -227,7 +227,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
 
             reply_data = raw_data.decode('utf-8')
             if not reply_data:
-                print(f"\n[ERROR] Data has not been came from user {target_username} (Timeout or disconnected).")
+                print(f"\n[ERROR] Data has not been pulled from user {target_username} (Timeout or disconnected).")
                 return False
             response = json.loads(reply_data)
             # data_reply = sock.recv(4096).decode('utf-8')
@@ -302,11 +302,12 @@ def download_content():
 def handle_tcp_client(conn, addr):
     try:
         data = conn.recv(4096).decode('utf-8')
-        if not data: return
+        if not data:
+            return
 
         msg = json.loads(data)
 
-        # 1. Aşama: Anahtar Değişimi İstendiyse
+        # 1: content requested securely
         if "key" in msg:
             remote_public = int(msg["key"])
             my_private = generate_dh_private_key()
@@ -314,11 +315,11 @@ def handle_tcp_client(conn, addr):
 
             shared_secret = calculate_dh_shared_secret(remote_public, my_private)
 
-            # Kendi public key'imizi gönderiyoruz
+            # Sending own public key
             reply = {"key": str(my_public)}
             conn.sendall(json.dumps(reply).encode('utf-8'))
 
-            # Şimdi aynı bağlantı üzerinden asıl dosya isteğini bekle (Secure Request)
+            # Waiting for request (Secure Request)
             data2 = conn.recv(4096).decode('utf-8')
             msg2 = json.loads(data2)
 
@@ -326,7 +327,7 @@ def handle_tcp_client(conn, addr):
                 chunk_name = msg2["requested secured content"]
                 raw_bytes = get_chunk_bytes(chunk_name)
 
-                # pyDes ile Şifreleme
+                # Encrypt with pyDes
                 des_key = get_des_key_bytes(shared_secret)
                 encrypted_bytes = pyDes.des(des_key, pyDes.ECB, pad=None, padmode=pyDes.PAD_PKCS5).encrypt(raw_bytes)
                 encoded_string = base64.b64encode(encrypted_bytes).decode('utf-8')
@@ -337,11 +338,11 @@ def handle_tcp_client(conn, addr):
                 }
                 conn.sendall(json.dumps(final_reply).encode('utf-8'))
 
-                # Secure (Şifreli) loglama kısmı:
+                # Secure logging:
                 with open(f"upload_log_{my_username}.txt", "a") as f:
                     f.write(f"[{datetime.now()}] {chunk_name} sent to {addr[0]} (SECURE)\n")
 
-        # 2. Aşama: Şifresiz İçerik İstendiyse
+        # 2: content requested unsecurely
         elif "requested content" in msg:
             chunk_name = msg["requested content"]
             raw_bytes = get_chunk_bytes(chunk_name)
@@ -359,7 +360,7 @@ def handle_tcp_client(conn, addr):
                 f.write(f"[{datetime.now()}] {chunk_name} sent to {addr[0]} (UNSECURE)\n")
 
     except Exception as e:
-        print(f"\n[UPLOAD HATA] {e}")
+        print(f"\n[UPLOAD ERROR] {e}")
     finally:
         conn.close()
 
@@ -369,12 +370,12 @@ def chunk_uploader():
     sock.bind(('0.0.0.0', 6001))
     sock.listen(5)
 
-    print("[CHUNK UPLOADER] Port 6001 dinleniyor (TCP)...")
+    print("[CHUNK UPLOADER] Listening on port 6001 (TCP)...")
 
     while True:
         try:
             conn, addr = sock.accept()
-            # Gelen her TCP isteği arayüzü dondurmasın diye ayrı bir thread'de işlenir
+            # Each TCP request is processed in different thread to avoid lag in UI
             threading.Thread(target=handle_tcp_client, args=(conn, addr), daemon=True).start()
         except Exception as e:
             pass
@@ -387,45 +388,45 @@ def user_interface():
     while True:
         is_ui_active = False
 
-        print("\n=== P2P DOSYA PAYLAŞIM MENÜSÜ ===")
-        print("1. View Contents (Ağdaki İçerikleri Gör)")
-        print("2. Download Content (İçerik İndir)")
-        print("3. History (İndirme/Yükleme Geçmişi)")
-        print("4. Çıkış")
+        print("\n=== P2P FILE SHARING MENU ===")
+        print("1. View Contents")
+        print("2. Download Content")
+        print("3. History")
+        print("4. Exit")
 
-        current_prompt = "Seçiminiz (1/2/3/4): "
+        current_prompt = "Choice (1/2/3/4): "
         is_ui_active = True
         choice = input(current_prompt)
-        is_ui_active = False  # Seçim yapıldıktan sonra kapat
+        is_ui_active = False  # Close after choice
 
         if choice == '1':
             view_contents()
         elif choice == '2':
             download_content()
         elif choice == '3':
-            print("\n--- DOWNLOAD GEÇMİŞİ ---")
+            print("\n--- Download History ---")
             log_file = f"download_log_{my_username}.txt"
             if os.path.exists(log_file):
                 with open(log_file, "r") as f:
                     print(f.read())
             else:
-                print("Henüz indirme geçmişi yok.")
+                print("No download history.")
         elif choice == '4':
-            print("\nProgram kapatılıyor...")
+            print("\nSee you later...")
             os._exit(0)
         else:
-            print("\n[HATA] Geçersiz seçim, lütfen tekrar deneyin.")
+            print("\n[ERROR] Invalid choice, try again.")
 
 if __name__ == "__main__":
     global my_username
     global my_chunks
-    my_username = input("Kullanıcı adınızı girin: ")
-    file_to_host = input("Host edilecek dosyanın adını girin (ör. forest.png): ")
+    my_username = input("Username: ")
+    file_to_host = input("Enter the filename to be hosted (ex. forest.png): ")
 
     if os.path.exists(file_to_host):
         my_chunks = chunk_announcer_real(file_to_host, num_chunks=3)
     else:
-        print(f"[UYARI] '{file_to_host}' klasörde bulunamadı. Sadece dinleyici olarak başlatılıyorsunuz.")
+        print(f"[WARNING] '{file_to_host}' couldnt find in folder. You are just a listener right now.")
         my_chunks = []
 
     # Threadleri başlat (Chunk Uploader TCP Thread'i eklendi)

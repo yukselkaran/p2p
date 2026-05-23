@@ -4,10 +4,9 @@ import os
 def check_file_exists(file_path):
     """Verilen dosya yolunun var olup olmadığını kontrol eder."""
     if not os.path.exists(file_path):
-        print(f"Hata: Dosya bulunamadı - {file_path}")
+        print(f"Error: Folder has not been found - {file_path}")
         return False
     return True
-
 
 # --- 2.1 CHUNK ANNOUNCER (Dosyayı 3'e Bölme) ---
 def chunk_announcer_real(filepath, num_chunks=3):
@@ -23,7 +22,7 @@ def chunk_announcer_real(filepath, num_chunks=3):
     # Geriye kalan byte'lar (son parçaya eklenecek)
     remainder = file_size % num_chunks
 
-    print(f"\n[BİLGİ] '{filepath}' dosyası {num_chunks} parçaya bölünüyor... Toplam boyut: {file_size} byte.")
+    print(f"\n[INFO] 'File {filepath}' is being splitted {num_chunks} parts... Total size: {file_size} byte.")
 
     chunks_created = []
 
@@ -39,7 +38,7 @@ def chunk_announcer_real(filepath, num_chunks=3):
             chunk_data = f_in.read(current_chunk_size)
 
             if not chunk_data:
-                print(f"[UYARI] Parça {i + 1} için veri okunamadı.")
+                print(f"[WARNING] Data in chunk {i + 1} couldnt be read.")
                 continue
 
             # Parça dosya adını oluştur (örn: 'forest_1')
@@ -50,9 +49,9 @@ def chunk_announcer_real(filepath, num_chunks=3):
             with open(chunk_filename, 'wb') as f_out:  # İkili modda yazma
                 f_out.write(chunk_data)
 
-            print(f"[BAŞARILI] {chunk_filename} parçası oluşturuldu. Boyut: {len(chunk_data)} byte.")
+            print(f"[SUCCESSFUL] Chunk {chunk_filename} has been created. Size: {len(chunk_data)} byte.")
 
-    print(f"\n[BİLGİ] Bölme işlemi tamamlandı. Oluşturulan parçalar: {chunks_created}")
+    print(f"\n[INFO] Splitting has been completed. Created chunks: {chunks_created}")
     return chunks_created
 
 
@@ -65,7 +64,7 @@ def chunk_merger_real(base_name, chunks, output_filename=None):
     if not output_filename:
         output_filename = f"{base_name}_merged.png"  # Varsayılan birleşik dosya adı
 
-    print(f"\n[BİLGİ] {chunks} parçaları birleştirilerek '{output_filename}' oluşturuluyor...")
+    print(f"\n[INFO] {chunks} will be merged, '{output_filename}' is being created...")
 
     # Parça dosyalarının varlığını kontrol et
     for chunk in chunks:
@@ -79,17 +78,17 @@ def chunk_merger_real(base_name, chunks, output_filename=None):
 
             # Veriyi birleşik dosyaya ekle (appending)
             f_out.write(chunk_data)
-            print(f"[BAŞARILI] {chunk_filename} parçası eklendi. Boyut: {len(chunk_data)} byte.")
+            print(f"[SUCCESSFUL] Chunk {chunk_filename} has been added. Size: {len(chunk_data)} byte.")
 
-    print(f"\n[BİLGİ] Birleştirme işlemi tamamlandı ve '{output_filename}' dosyası oluşturuldu.")
+    print(f"\n[INFO] Merging has been completed and file '{output_filename}' has been created.")
 
     # Doğrulama: Birleşik dosyanın boyutu parçaların toplam boyutuna eşit mi?
     original_filepath = f"{base_name}.png"
     if os.path.exists(original_filepath):
         if os.path.getsize(output_filename) == os.path.getsize(original_filepath):
-            print(f"[DOĞRULAMA] Birleşmiş dosya boyutu orijinal dosya boyutuyla eşleşiyor.")
+            print(f"[CORRECTION] Original file and merged file sizes are same.")
         else:
-            print(f"[UYARI] Birleşmiş dosya boyutu orijinal dosya boyutuyla eşleşmiyor!")
+            print(f"[WARNING] Original file and merged file sizes are not same!")
 
 
 # --- TEST KULLANIMI ---

@@ -58,7 +58,7 @@ def chunk_announcer(username, chunks_to_host):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     print("\n[CHUNK ANNOUNCER] Dosyalar anons edilmeye başlanıyor... (Her 8 saniyede bir)")
-    broadcast_ip = '<broadcast>' # 192.168.1.255 olacak sonrasında
+    broadcast_ip = '192.168.1.255' #  '<broadcast>' ile değiştirdim
 
     while True:
         try:

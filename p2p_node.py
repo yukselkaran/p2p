@@ -16,6 +16,8 @@ current_prompt = ""
 
 P = 907
 G = 7
+UDP_PORT = 6000
+TCP_PORT = 6001
 
 # ---------------------------------------------------------
 # ORTAK SÖZLÜKLER (SHARED DICTIONARIES) - Req 2.2.0-C, D, E
@@ -47,7 +49,7 @@ def get_chunk_bytes(chunk_name):
         with open(chunk_name, 'rb') as f:
             return f.read()
     except FileNotFoundError:
-        print(f"\n[HATA] {chunk_name} diskinizde bulunamadı!")
+        print(f"\n[ERROR] {chunk_name} has not been found in storage.")
         return b"" # Dosya yoksa boş byte döndür
 
 # ---------------------------------------------------------
@@ -57,8 +59,8 @@ def chunk_announcer(username, chunks_to_host):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    print("\n[CHUNK ANNOUNCER] Dosyalar anons edilmeye başlanıyor... (Her 8 saniyede bir)")
-    broadcast_ip = '192.168.1.255' #  '<broadcast>' ile değiştirdim
+    print("\n[CHUNK ANNOUNCER] Files are being announced... (1 per 8 seconds)")
+    broadcast_ip = "<broadcast>" # proje tesliminde 192.168.1.255 olacak
 
     while True:
         try:
@@ -68,9 +70,9 @@ def chunk_announcer(username, chunks_to_host):
             }
             json_msg = json.dumps(announce_msg).encode('utf-8')
 
-            sock.sendto(json_msg, (broadcast_ip, 6000))
+            sock.sendto(json_msg, (broadcast_ip, UDP_PORT))
         except Exception as e:
-            print(f"\n[HATA] Anons atılırken bir sorun oluştu: {e}")
+            print(f"\n[ERROR] A problem occured during announcement: {e}")
         time.sleep(8)
 
 # ---------------------------------------------------------
@@ -78,11 +80,10 @@ def chunk_announcer(username, chunks_to_host):
 # ---------------------------------------------------------
 def content_discovery():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Aynı makinede birden fazla node test edebilmek için REUSEADDR açık
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('0.0.0.0', 6000))
+    sock.bind(('0.0.0.0', UDP_PORT))
 
-    print("[CONTENT DISCOVERY] Port 6000 dinleniyor...")
+    print("[CONTENT DISCOVERY, UDP] Port 6000 is being listened...")
 
     while True:
         try:
@@ -111,7 +112,7 @@ def content_discovery():
                 # Konsola yazdır (Req 2.2.0-F) - SADECE YENİ BİR ŞEY EKLENDİYSE
                 if inserted_any:
                     chunks_str = ", ".join(hosted_chunks)
-                    log_msg = f"[KEŞİF] {sender_username} : {chunks_str}"
+                    log_msg = f"[USER : CHUNK] {sender_username} : {chunks_str}"
 
                     global is_ui_active, current_prompt
                     sys.stdout.write('\r' + ' ' * 80 + '\r') # öncelik olsun diye sys kullan
@@ -122,7 +123,7 @@ def content_discovery():
                         sys.stdout.write(current_prompt)
                         sys.stdout.flush()
         except Exception as e:
-            pass
+            print(f"\n[DISCOVERY THREAD ERROR] {e}")
 
 # ---------------------------------------------------------
 # Req 2.2.0-G: Clear dictionary once per 60 seconds.
@@ -138,19 +139,19 @@ def wipe_dictionary_routine():
 # ---------------------------------------------------------
 def view_contents():
     """
-    Sözlükteki chunk isimlerini (örn: forest_1) baz adına (forest) çevirerek
-    benzersiz dosyaları listeler.
+    Sözlükteki chunk isimlerini (örn: forest_1) asıl adına (forest) çevirerek
+    benzersiz dosyaları listeler
     """
-    print("\n--- AĞDA BULUNAN İÇERİKLER ---")
+    print("\n--- Contents in Network ---")
     available_files = set()
 
     for chunk_name in content_dict.keys():
-        # Sondaki '_1', '_2' kısmını atarak asıl dosya adını buluyoruz
+        # Sondaki '_1', '_2' kısmını atarak asıl dosya adını bul
         base_name = chunk_name.rsplit('_', 1)[0]
         available_files.add(base_name)
 
     if not available_files:
-        print("Şu an ağda keşfedilmiş bir içerik yok. (Bekleniyor...)")
+        print("There is no any discovered content in network. (Waiting...)")
     else:
         for file in available_files:
             print(f"- {file}")
@@ -161,13 +162,16 @@ def view_contents():
 # ---------------------------------------------------------
 def download_single_chunk(chunk_name, ip_address, is_secure):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(None) #pyDes yüzünden...
+    if is_secure:
+        sock.settimeout(None)
+    else:
+        sock.settimeout(None) # bunu 50 üsttekini 300 yap çalışınca
     target_username = ip_to_username.get(ip_address, ip_address)
 
     try:
-        sock.connect((ip_address, 6001))
+        sock.connect((ip_address, TCP_PORT))
         print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] {chunk_name} is requested from user {target_username}...")
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] {chunk_name} is requested from user '{target_username}'...")
 
         if is_secure:
             # Diffie-Hellman Key Exchange
@@ -196,7 +200,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
 
             reply_data = raw_data.decode('utf-8')
             if not reply_data:
-                print(f"\n[ERROR] Data has not been pulled from user {target_username} (Timeout or disconnected).")
+                print(f"\n[ERROR] Data has not been pulled from user '{target_username}' (Timeout or disconnected).")
                 return False
             response = json.loads(reply_data)
             # data_reply = sock.recv(4096).decode('utf-8')
@@ -227,7 +231,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
 
             reply_data = raw_data.decode('utf-8')
             if not reply_data:
-                print(f"\n[ERROR] Data has not been pulled from user {target_username} (Timeout or disconnected).")
+                print(f"\n[ERROR] Data has not been pulled from user '{target_username}' (Timeout or disconnected).")
                 return False
             response = json.loads(reply_data)
             # data_reply = sock.recv(4096).decode('utf-8')
@@ -252,7 +256,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
         return True
 
     except Exception as e:
-        print(f"[ERROR] {chunk_name} couldnt be downloaded from user {target_username}: {e}")
+        print(f"[ERROR] {chunk_name} couldnt be downloaded from user '{target_username}': {e}")
         return False
     finally:
         sock.close()
@@ -367,10 +371,10 @@ def handle_tcp_client(conn, addr):
 def chunk_uploader():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('0.0.0.0', 6001))
+    sock.bind(('0.0.0.0', TCP_PORT))
     sock.listen(5)
 
-    print("[CHUNK UPLOADER] Listening on port 6001 (TCP)...")
+    print("[CHUNK UPLOADER, TCP] Listening on port 6001...")
 
     while True:
         try:
@@ -392,9 +396,10 @@ def user_interface():
         print("1. View Contents")
         print("2. Download Content")
         print("3. History")
-        print("4. Exit")
+        print("4. Host new file")
+        print("5. Exit")
 
-        current_prompt = "Choice (1/2/3/4): "
+        current_prompt = "Choice (1/2/3/4/5): "
         is_ui_active = True
         choice = input(current_prompt)
         is_ui_active = False  # Close after choice
@@ -412,24 +417,44 @@ def user_interface():
             else:
                 print("No download history.")
         elif choice == '4':
+            new_file = input("Enter the filename to be hosted (ex. forest.png): ")
+            if os.path.exists(new_file):
+                print(f"\n[{new_file}] is being processed...")
+                chunks = chunk_announcer_real(new_file, num_chunks=3)
+                if chunks:
+                    my_chunks.extend(chunks)  # Bölünen parçaları ana listeye ekle
+                    print(f"[SUCCESSFUL] '{new_file}' has been splitted into chunks and is being announced to network.")
+            else:
+                print(f"[ERROR] '{new_file}' has not been found in folder.")
+        elif choice == '5':
             print("\nSee you later...")
             os._exit(0)
         else:
             print("\n[ERROR] Invalid choice, try again.")
 
+
 if __name__ == "__main__":
     global my_username
     global my_chunks
-    my_username = input("Username: ")
+
+    my_username = input("Enter username: ")
     file_to_host = input("Enter the filename to be hosted (ex. forest.png): ")
+    my_chunks = []  # Başlangıçta liste sıfırlanıyor
 
-    if os.path.exists(file_to_host):
-        my_chunks = chunk_announcer_real(file_to_host, num_chunks=3)
+    if file_to_host.strip():
+        if os.path.exists(file_to_host):
+            print(f"\n[{file_to_host}] is being processed...")
+            chunks = chunk_announcer_real(file_to_host, num_chunks=3)
+            if chunks:
+                my_chunks.extend(chunks)
+                print(f"[SUCCESFULL] '{file_to_host}' has been splitted into chunks and is being announced to network.")
+        else:
+            print(f"[WARNING] '{file_to_host}' has not been found in folder. You are only-listener.")
     else:
-        print(f"[WARNING] '{file_to_host}' couldnt find in folder. You are just a listener right now.")
-        my_chunks = []
+        print("[INFO] No filename entered. You are only-listener.")
+    # ----------------------------------
 
-    # Threadleri başlat (Chunk Uploader TCP Thread'i eklendi)
+    # Threadleri başlat (Port 6001 sabit olarak arka planda çalışır)
     threading.Thread(target=chunk_announcer, args=(my_username, my_chunks), daemon=True).start()
     threading.Thread(target=content_discovery, daemon=True).start()
     threading.Thread(target=wipe_dictionary_routine, daemon=True).start()

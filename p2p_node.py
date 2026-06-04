@@ -60,7 +60,7 @@ def chunk_announcer(username, chunks_to_host):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     print("\n[CHUNK ANNOUNCER] Files are being announced... (1 per 8 seconds)")
-    broadcast_ip = "<broadcast>" # proje tesliminde 192.168.1.255 olacak
+    broadcast_ip = "255.255.255.255" # proje tesliminde 192.168.1.255 olacak
 
     while True:
         try:
@@ -109,14 +109,24 @@ def content_discovery():
                         content_dict[chunk].append(sender_username)
                         inserted_any = True  # Yeni bir kayıt eklendiğini işaretle
 
-                # Konsola yazdır (Req 2.2.0-F) - SADECE YENİ BİR ŞEY EKLENDİYSE
                 if inserted_any:
                     chunks_str = ", ".join(hosted_chunks)
                     log_msg = f"[USER : CHUNK] {sender_username} : {chunks_str}"
 
                     global is_ui_active, current_prompt
-                    sys.stdout.write('\r' + ' ' * 80 + '\r') # öncelik olsun diye sys kullan
+                    sys.stdout.write('\r' + ' ' * 80 + '\r') 
                     print(log_msg)
+
+                    # 1. Sözlüğü JSON olarak kaydet
+                    save_state_to_file()
+
+                    # 2. GÜNCEL EKLENTİ: Gelen paketi tam olarak JSON formatında TXT'ye kaydet
+                    global my_username
+                    with open(f"discovery_log_{my_username}.txt", "a", encoding="utf-8") as f:
+                        # msg değişkeni zaten gelen JSON'ın sözlük haliydi, 
+                        # dumps ile onu tekrar kurallı bir JSON metnine çevirip dosyaya yazıyoruz.
+                        raw_json_str = json.dumps(msg, ensure_ascii=False)
+                        f.write(f"{raw_json_str}\n")
 
                     # Eğer kullanıcı o an input bekliyorsa, soruyu tekrar yazdır
                     if is_ui_active:
@@ -128,10 +138,23 @@ def content_discovery():
 # ---------------------------------------------------------
 # Req 2.2.0-G: Clear dictionary once per 60 seconds.
 # ---------------------------------------------------------
+def save_state_to_file():
+    global my_username
+    # Ağın o anki fotoğrafını çekiyoruz
+    state = {
+        "ip_to_username": ip_to_username,
+        "username_to_ip": username_to_ip,
+        "content_dict": content_dict
+    }
+    # Dosyaya güzel görünmesi için indent=4 ile yazdırıyoruz
+    with open(f"network_state_{my_username}.json", "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4, ensure_ascii=False)
+        
 def wipe_dictionary_routine():
     while True:
         time.sleep(60)
         content_dict.clear()
+        save_state_to_file() # SÖZLÜK TEMİZLENDİKTEN SONRA DOSYAYI GÜNCELLE
         print("\n[SYSTEM] Content dictionary has been cleared.")
 
 # ---------------------------------------------------------
@@ -162,16 +185,12 @@ def view_contents():
 # ---------------------------------------------------------
 def download_single_chunk(chunk_name, ip_address, is_secure):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if is_secure:
-        sock.settimeout(None)
-    else:
-        sock.settimeout(None) # bunu 50 üsttekini 300 yap çalışınca
     target_username = ip_to_username.get(ip_address, ip_address)
 
     try:
         sock.connect((ip_address, TCP_PORT))
         print(
-            f"\n[{datetime.now().strftime('%H:%M:%S')}] {chunk_name} is requested from user '{target_username}'...")
+            f"\n[{datetime.now().strftime('%H:%M:%S')}] {chunk_name} has been requested from user '{target_username}'...")
 
         if is_secure:
             # Diffie-Hellman Key Exchange
@@ -185,8 +204,9 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
             remote_public = int(json.loads(reply_data)["key"])
             shared_secret = calculate_dh_shared_secret(remote_public, my_private)
 
-            content_req = {"requested secured content": chunk_name}
+            content_req = {"requested_secured_content": chunk_name}
             sock.sendall(json.dumps(content_req).encode('utf-8'))
+            sock.settimeout(10)
 
             raw_data = b""
             while True:
@@ -196,6 +216,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
                         break
                     raw_data += packet
                 except socket.timeout:
+                    print("[ERROR] Timeout during download_single_chunk (SECURE).")
                     break
 
             reply_data = raw_data.decode('utf-8')
@@ -206,7 +227,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
             # data_reply = sock.recv(4096).decode('utf-8')
             # msg = json.loads(data_reply)
 
-            encrypted_bytes = base64.b64decode(response["encrypted chunk"])
+            encrypted_bytes = base64.b64decode(response["encrypted_chunk"])
             des_key = get_des_key_bytes(shared_secret)
             decrypted_bytes = pyDes.des(des_key, pyDes.ECB, pad=None, padmode=pyDes.PAD_PKCS5).decrypt(encrypted_bytes)
 
@@ -216,9 +237,9 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
             print(f"[SUCCESS] {chunk_name} has been downloaded securely.")
 
         else: # unsecure
-            content_req = {"requested content": chunk_name}
+            content_req = {"requested_content": chunk_name}
             sock.sendall(json.dumps(content_req).encode('utf-8'))
-
+            sock.settimeout(5)
             raw_data = b""
             while True:
                 try:
@@ -227,6 +248,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
                         break
                     raw_data += packet
                 except socket.timeout:
+                    print("[ERROR] Timeout during download_single_chunk (UNSECURE).")
                     break
 
             reply_data = raw_data.decode('utf-8')
@@ -246,7 +268,7 @@ def download_single_chunk(chunk_name, ip_address, is_secure):
         if chunk_name not in my_chunks:
             my_chunks.append(chunk_name)
             print(
-                f"[P2P] {chunk_name} has been downloaded successfully and is being presented by you too.")
+                f"[P2P] {chunk_name} has been downloaded successfully and is being sent by you too.")
 
         # Loglama
         with open(f"download_log_{my_username}.txt", "a") as f:
@@ -327,8 +349,8 @@ def handle_tcp_client(conn, addr):
             data2 = conn.recv(4096).decode('utf-8')
             msg2 = json.loads(data2)
 
-            if "requested secured content" in msg2:
-                chunk_name = msg2["requested secured content"]
+            if "requested_secured_content" in msg2:
+                chunk_name = msg2["requested_secured_content"]
                 raw_bytes = get_chunk_bytes(chunk_name)
 
                 # Encrypt with pyDes
@@ -337,8 +359,8 @@ def handle_tcp_client(conn, addr):
                 encoded_string = base64.b64encode(encrypted_bytes).decode('utf-8')
 
                 final_reply = {
-                    "chunk name": chunk_name,
-                    "encrypted chunk": encoded_string
+                    "chunk_name": chunk_name,
+                    "encrypted_chunk": encoded_string
                 }
                 conn.sendall(json.dumps(final_reply).encode('utf-8'))
 
@@ -347,14 +369,14 @@ def handle_tcp_client(conn, addr):
                     f.write(f"[{datetime.now()}] {chunk_name} sent to {addr[0]} (SECURE)\n")
 
         # 2: content requested unsecurely
-        elif "requested content" in msg:
-            chunk_name = msg["requested content"]
+        elif "requested_content" in msg:
+            chunk_name = msg["requested_content"]
             raw_bytes = get_chunk_bytes(chunk_name)
 
             encoded_string = base64.b64encode(raw_bytes).decode('utf-8')
 
             final_reply = {
-                "chunk name": chunk_name,
+                "chunk_name": chunk_name,
                 "data": encoded_string
             }
             conn.sendall(json.dumps(final_reply).encode('utf-8'))
